@@ -1,0 +1,302 @@
+import socket
+import tkinter as tk
+from tkinter import scrolledtext, ttk, filedialog, messagebox
+import os
+import requests
+import concurrent.futures
+from threading import Lock, Thread
+from fpdf import FPDF
+
+# Constants
+VIRUSTOTAL_API_KEY = "84a61791e4de03e6636ae6ec808432aecfd20099453760e186260dc60d9dab2d"
+VIRUSTOTAL_URL = "https://www.virustotal.com/vtapi/v2/ip-address/report"
+DEFAULT_PORTS = (1, 1025)
+
+class NetworkScanner:
+    def __init__(self, ip_range, update_callback, progress_callback, port_range=DEFAULT_PORTS):
+        self.ip_range = ip_range
+        self.active_ips = []
+        self.open_ports = {}
+        self.malware_reports = []
+        self.lock = Lock()
+        self.update_callback = update_callback
+        self.progress_callback = progress_callback
+        self.port_range = port_range
+
+    def scan_ips(self):
+        total_ips = len(self.ip_range)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            futures = [executor.submit(self.check_ip, ip) for ip in self.ip_range]
+            for idx, future in enumerate(concurrent.futures.as_completed(futures)):
+                future.result()
+                self.progress_callback(int((idx + 1) / total_ips * 100))
+
+    def check_ip(self, ip):
+        if self.is_ip_active(ip):
+            with self.lock:
+                self.active_ips.append(ip)
+                self.update_callback(f"IP {ip} is active.")
+                self.open_ports[ip] = self.scan_ports(ip)
+
+    def is_ip_active(self, ip):
+        response = os.system(f"ping -n 1 {ip} >nul 2>&1")
+        return response == 0
+
+    def scan_ports(self, ip):
+        open_ports = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
+            futures = [executor.submit(self.check_port, ip, port) for port in range(self.port_range[0], self.port_range[1])]
+            results = [future.result() for future in concurrent.futures.as_completed(futures)]
+        return [port for port, is_open in results if is_open]
+
+    def check_port(self, ip, port):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.5)
+            try:
+                result = sock.connect_ex((ip, port))
+                return port, result == 0
+            except socket.error:
+                return port, False
+
+    def check_malware(self):
+        for ip in self.active_ips:
+            report = self.get_virustotal_report(ip)
+            if report:
+                self.malware_reports.append(report)
+                self.update_callback(report)
+            else:
+                self.update_callback(f"Checked {ip}: No malware found")
+
+    def get_virustotal_report(self, ip):
+        params = {'apikey': VIRUSTOTAL_API_KEY, 'ip': ip}
+        try:
+            response = requests.get(VIRUSTOTAL_URL, params=params)
+            if response.status_code == 200:
+                data = response.json()
+                if 'detected_urls' in data and data['detected_urls']:
+                    threat_details = []
+                    for url_info in data['detected_urls']:
+                        threat = url_info.get('url', 'Unknown')
+                        positives = url_info.get('positives', 0)
+                        total = url_info.get('total', 0)
+                        threat_type = self.classify_threat(url_info.get('scan_date', ''))
+                        threat_rank = self.rank_threat(positives, total)
+                        threat_details.append(
+                            f"Threat: {threat} | Positives: {positives}/{total} | Rank: {threat_rank} | Type: {threat_type}"
+                        )
+                    return f"Checked {ip}: Found malware or suspicious activity:\n" + "\n".join(threat_details)
+                else:
+                    return f"Checked {ip}: No malware found."
+            elif response.status_code == 204:
+                return f"Checked {ip}: No data available."
+            else:
+                return f"Checked {ip}: VirusTotal API error. Status code: {response.status_code}"
+        except Exception as e:
+            return f"Checked {ip}: Error connecting to VirusTotal: {e}"
+
+    def classify_threat(self, scan_data):
+        scan_data = scan_data.lower()
+        threat_type = "Malware"
+        if "spy" in scan_data:
+            threat_type = "Spyware"
+        elif "adware" in scan_data:
+            threat_type = "Adware"
+        elif "ransom" in scan_data:
+            threat_type = "Ransomware"
+        elif "virus" in scan_data:
+            threat_type = "Virus"
+        elif "worm" in scan_data:
+            threat_type = "Worm"
+        elif "rat" in scan_data:
+            threat_type = "Remote Access Trojan (RAT)"
+        elif "trojan" in scan_data:
+            threat_type = "Trojan"
+        elif "rootkit" in scan_data:
+            threat_type = "Rootkit"
+        elif "keylogger" in scan_data:
+            threat_type = "Keylogger"
+
+        return threat_type
+
+    def rank_threat(self, positives, total):
+        detection_ratio = positives / total if total > 0 else 0
+        if detection_ratio > 0.75:
+            return "Critical"
+        elif detection_ratio > 0.5:
+            return "High"
+        elif detection_ratio > 0.25:
+            return "Medium"
+        else:
+            return "Low"
+
+    def generate_report(self):
+        report = "Active IPs:\n"
+        if not self.active_ips:
+            report += "No active IPs found.\n"
+        for ip in self.active_ips:
+            report += f"{ip}: Open Ports: {self.open_ports[ip]}\n"
+        report += "\nMalware Reports:\n"
+        for malware_report in self.malware_reports:
+            report += f"{malware_report}\n"
+        return report
+
+    def export_to_pdf(self, filename):
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Arial", size=12)
+        report = self.generate_report()
+        pdf.multi_cell(0, 10, report)
+        pdf.output(filename)
+
+class GUI:
+    def __init__(self, master):
+        self.master = master
+        master.title("Triple O Network Scanner")
+        master.geometry("900x600")
+        master.configure(bg='#2E2E2E')
+        master.minsize(600, 400)
+
+        self.create_widgets()
+        self.layout_widgets()
+
+    def create_widgets(self):
+        self.label = tk.Label(self.master, text="Enter IP range (e.g., 192.168.1.1-192.168.1.255):", bg='#2E2E2E', fg='white', font=('Arial', 12))
+        self.ip_entry = tk.Entry(self.master, font=('Arial', 12))
+
+        self.port_label = tk.Label(self.master, text="Port range (e.g., 1-1025):", bg='#2E2E2E', fg='white', font=('Arial', 12))
+        self.port_entry = tk.Entry(self.master, font=('Arial', 12))
+
+        self.scan_button = tk.Button(self.master, text="Start Scan", command=self.start_scan, bg='#4CAF50', fg='white', font=('Arial', 12))
+        self.clear_button = tk.Button(self.master, text="Clear Output", command=self.clear_output, bg='#FF5722', fg='white', font=('Arial', 12))
+        self.save_report_button = tk.Button(self.master, text="Save Report", command=self.save_report, bg='#FFC107', fg='white', font=('Arial', 12))
+        self.save_pdf_button = tk.Button(self.master, text="Save as PDF", command=self.save_pdf, bg='#009688', fg='white', font=('Arial', 12))
+
+        self.report_box = scrolledtext.ScrolledText(self.master, bg='#333333', fg='white', font=('Arial', 12), wrap=tk.WORD)
+
+        self.progress_bar = ttk.Progressbar(self.master, orient='horizontal', mode='determinate')
+
+        self.status_label = tk.Label(self.master, text="Idle", bg='#2E2E2E', fg='white', anchor='w', font=('Arial', 12))
+
+    def layout_widgets(self):
+        # Grid configuration
+        self.master.grid_columnconfigure(0, weight=1)
+        self.master.grid_columnconfigure(1, weight=2)
+        self.master.grid_columnconfigure(2, weight=1)
+        self.master.grid_columnconfigure(3, weight=1)
+        self.master.grid_columnconfigure(4, weight=1)
+
+        # Widgets layout
+        self.label.grid(row=0, column=0, columnspan=2, padx=10, pady=5, sticky='w')
+        self.ip_entry.grid(row=1, column=0, columnspan=2, padx=10, pady=5, sticky='ew')
+        self.port_label.grid(row=2, column=0, columnspan=2, padx=10, pady=5, sticky='w')
+        self.port_entry.grid(row=3, column=0, columnspan=2, padx=10, pady=5, sticky='ew')
+
+        self.scan_button.grid(row=4, column=0, padx=10, pady=5, sticky='ew')
+        self.clear_button.grid(row=4, column=1, padx=10, pady=5, sticky='ew')
+        self.save_report_button.grid(row=5, column=0, padx=10, pady=5, sticky='ew')
+        self.save_pdf_button.grid(row=5, column=1, padx=10, pady=5, sticky='ew')
+
+        self.report_box.grid(row=6, column=0, columnspan=4, padx=10, pady=5, sticky='nsew')
+        self.progress_bar.grid(row=7, column=0, columnspan=4, padx=10, pady=5, sticky='ew')
+        self.status_label.grid(row=8, column=0, columnspan=4, padx=10, pady=5, sticky='w')
+
+        self.master.grid_rowconfigure(6, weight=1)
+        self.master.grid_rowconfigure(7, weight=0)
+        self.master.grid_rowconfigure(8, weight=0)
+
+    def start_scan(self):
+        ip_range = self.ip_entry.get().split('-')
+        if len(ip_range) != 2:
+            messagebox.showerror("Input Error", "Please enter a valid IP range.")
+            return
+
+        ip_start, ip_end = ip_range
+        try:
+            ip_range = self.expand_ip_range(ip_start, ip_end)
+        except ValueError as e:
+            messagebox.showerror("Input Error", str(e))
+            return
+
+        port_range = self.port_entry.get().split('-')
+        if len(port_range) != 2:
+            messagebox.showerror("Input Error", "Please enter a valid port range.")
+            return
+
+        try:
+            port_start, port_end = map(int, port_range)
+            port_range = (port_start, port_end)
+        except ValueError:
+            messagebox.showerror("Input Error", "Port range must be valid integers.")
+            return
+
+        self.progress_bar['value'] = 0
+        self.status_label['text'] = "Scanning..."
+
+        scanner = NetworkScanner(ip_range, self.update_status, self.update_progress, port_range)
+        self.scan_thread = Thread(target=self.run_scan, args=(scanner,))
+        self.scan_thread.start()
+
+    def run_scan(self, scanner):
+        scanner.scan_ips()
+        scanner.check_malware()
+        self.update_status("Scan complete.")
+        self.update_status(scanner.generate_report())
+        self.progress_bar['value'] = 100
+        self.status_label['text'] = "Scan complete."
+
+    def update_status(self, message):
+        self.report_box.insert(tk.END, message + "\n")
+        self.report_box.yview(tk.END)
+
+    def update_progress(self, value):
+        self.progress_bar['value'] = value
+
+    def expand_ip_range(self, ip_start, ip_end):
+        ip_start_parts = list(map(int, ip_start.split('.')))
+        ip_end_parts = list(map(int, ip_end.split('.')))
+        if len(ip_start_parts) != 4 or len(ip_end_parts) != 4:
+            raise ValueError("Invalid IP address format.")
+
+        ip_range = []
+        for a in range(ip_start_parts[0], ip_end_parts[0] + 1):
+            for b in range(ip_start_parts[1], ip_end_parts[1] + 1):
+                for c in range(ip_start_parts[2], ip_end_parts[2] + 1):
+                    for d in range(ip_start_parts[3], ip_end_parts[3] + 1):
+                        ip_range.append(f"{a}.{b}.{c}.{d}")
+
+        return ip_range
+
+    def clear_output(self):
+        self.report_box.delete(1.0, tk.END)
+        self.progress_bar['value'] = 0
+        self.status_label['text'] = "Idle"
+
+    def save_report(self):
+        filename = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text files", "*.txt")])
+        if filename:
+            try:
+                report = self.report_box.get(1.0, tk.END)
+                with open(filename, 'w') as file:
+                    file.write(report)
+                messagebox.showinfo("Export Successful", f"Data exported to {filename}")
+            except Exception as e:
+                messagebox.showerror("Export Error", str(e))
+
+    def save_pdf(self):
+        filename = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF files", "*.pdf")])
+        if filename:
+            try:
+                report = self.report_box.get(1.0, tk.END)
+                pdf = FPDF()
+                pdf.add_page()
+                pdf.set_font("Arial", size=12)
+                pdf.multi_cell(0, 10, report)
+                pdf.output(filename)
+                messagebox.showinfo("Export Successful", f"Data exported to {filename}")
+            except Exception as e:
+                messagebox.showerror("Export Error", str(e))
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    gui = GUI(root)
+    root.mainloop()
